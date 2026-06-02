@@ -65,12 +65,6 @@ BadPwdLookup.exe
 
 ---
 
-## Screenshots
-
-> *(Add screenshots here)*
-
----
-
 ## How It Works
 
 The tool writes PowerShell scripts to temporary `.ps1` files at runtime (avoiding inline escaping bugs), then executes them via `subprocess` with `CREATE_NO_WINDOW`. Each DC is queried in a separate thread using `Invoke-Command` over WinRM. Results are merged, deduplicated by `(Time, EventId, Computer, IP)`, and sorted descending by timestamp before display.
