@@ -84,7 +84,7 @@ Output will be in `dist/BadPwdLookup.exe`.
 
 ## Intended Use
 
-Built for **IT support and sysadmin teams** in Active Directory environments to speed up lockout investigations — replacing the multi-step process of remoting into each DC and manually filtering Security event logs.
+Built for **IT support and sysadmin teams** in Active Directory environments to speed up lockout investigations.
 
 ---
 
