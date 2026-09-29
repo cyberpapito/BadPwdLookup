@@ -4,7 +4,7 @@ Bad Password Lookup  v3
 - Uses Invoke-Command (WinRM) — no RPC/remote event log needed
 - Writes PowerShell to a real temp .ps1 file — no inline escaping bugs
 - Resolves ::ffff: IPs to hostnames for Kerberos (4771) events
-- Queries 4625, 4771, 4776, 4740 across all DCs
+- Queries 4625, 4771, 4776, 4740 across all DCs over a lookback window
 
 Requirements:
   - Python 3.7+, Windows, domain-joined
@@ -12,9 +12,11 @@ Requirements:
   - WinRM accessible to DCs (usually open by default on domain DCs)
 """
 
+from __future__ import annotations   # list[str] / tuple[...] hints on Python 3.7 and 3.8
+
 import tkinter as tk
 from tkinter import ttk
-import subprocess, json, threading, tempfile, os
+import subprocess, json, threading, tempfile, os, re
 from datetime import datetime
 
 # ── palette ───────────────────────────────────────────────────────────────────
@@ -57,10 +59,17 @@ try {
 }
 """
 
+DEFAULT_LOOKBACK_HOURS = 24
+
 # This script runs INSIDE Invoke-Command on the DC itself
-# $Username is passed as -ArgumentList
+# $Username and $Hours are passed as -ArgumentList.
+# Events are read for the whole lookback window and then filtered by user.
+# (A -MaxEvents cap applied before the user filter only looked at the newest
+# few hundred events, which on a busy DC can be just minutes of history.)
 PS_QUERY_ON_DC = """
-param([string]$Username)
+param([string]$Username, [int]$Hours)
+
+$since = (Get-Date).AddHours(-$Hours)
 
 function Get-Field($e, $name) {
     try {
@@ -79,11 +88,14 @@ function Resolve-IP([string]$raw) {
 
 $out = [System.Collections.Generic.List[PSCustomObject]]::new()
 
+# Machine names like \\\\WS01: -replace takes a regex, so '\\\\' (one literal backslash) strips
+# them all. A lone '\\' is an invalid pattern and throws, which the try/catch would swallow.
+
 # 4740 - Account lockout (CallerComputerName is the source machine)
 try {
-    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4740} -MaxEvents 200 -EA Stop |
+    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4740;StartTime=$since} -EA Stop |
     Where-Object { (Get-Field $_ 'TargetUserName') -eq $Username } | ForEach-Object {
-        $comp = (Get-Field $_ 'CallerComputerName') -replace '\\\\','' -replace '\\',''
+        $comp = (Get-Field $_ 'CallerComputerName') -replace '\\\\',''
         $out.Add([PSCustomObject]@{
             Time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
             EventId=4740; Computer=$comp; IP=''; LogonType='Lockout'
@@ -93,7 +105,7 @@ try {
 
 # 4771 - Kerberos pre-auth failure (IP only, resolve to hostname)
 try {
-    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4771} -MaxEvents 500 -EA Stop |
+    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4771;StartTime=$since} -EA Stop |
     Where-Object { (Get-Field $_ 'TargetUserName') -eq $Username } | ForEach-Object {
         $rawIp = Get-Field $_ 'IpAddress'
         $ip    = $rawIp -replace '^::ffff:',''
@@ -106,10 +118,11 @@ try {
 } catch {}
 
 # 4776 - NTLM credential validation (Workstation always present)
+# Logged for successes too: Status 0x0 means the credentials were valid, so skip it
 try {
-    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4776} -MaxEvents 500 -EA Stop |
-    Where-Object { (Get-Field $_ 'TargetUserName') -eq $Username } | ForEach-Object {
-        $comp = (Get-Field $_ 'Workstation') -replace '\\\\','' -replace '\\',''
+    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4776;StartTime=$since} -EA Stop |
+    Where-Object { (Get-Field $_ 'TargetUserName') -eq $Username -and (Get-Field $_ 'Status') -ne '0x0' } | ForEach-Object {
+        $comp = (Get-Field $_ 'Workstation') -replace '\\\\',''
         $out.Add([PSCustomObject]@{
             Time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
             EventId=4776; Computer=$comp; IP=''; LogonType='NTLM'
@@ -119,9 +132,9 @@ try {
 
 # 4625 - Generic failed logon (WorkstationName, fall back to IP resolve)
 try {
-    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625} -MaxEvents 500 -EA Stop |
+    Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=$since} -EA Stop |
     Where-Object { (Get-Field $_ 'TargetUserName') -eq $Username } | ForEach-Object {
-        $comp = (Get-Field $_ 'WorkstationName') -replace '\\\\','' -replace '\\',''
+        $comp = (Get-Field $_ 'WorkstationName') -replace '\\\\',''
         $ip   = Get-Field $_ 'IpAddress'
         $lt   = Get-Field $_ 'LogonType'
         if (-not $comp -and $ip) { $comp = Resolve-IP $ip }
@@ -155,9 +168,10 @@ try {
         LastLogon       = if ($u.LastLogonDate)   { $u.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss')   } else { 'N/A' }
     } | ConvertTo-Json
 } catch {
-    # ADSI fallback
+    # ADSI fallback (escape LDAP filter metacharacters, RFC 4515)
+    $esc = $Username.Replace('\\','\\5c').Replace('*','\\2a').Replace('(','\\28').Replace(')','\\29')
     $s = New-Object System.DirectoryServices.DirectorySearcher([adsi]"LDAP://$DC")
-    $s.Filter = "(&(objectClass=user)(sAMAccountName=$Username))"
+    $s.Filter = "(&(objectClass=user)(sAMAccountName=$esc))"
     'sAMAccountName','displayName','lockoutTime','badPwdCount','badPasswordTime','pwdLastSet','lastLogon' |
         ForEach-Object { [void]$s.PropertiesToLoad.Add($_) }
     $r = $s.FindOne()
@@ -195,7 +209,7 @@ def run_ps_file(path: str, args: list[str] = None, timeout: int = 45) -> tuple[b
     CREATE_NO_WINDOW = 0x08000000
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           creationflags=CREATE_NO_WINDOW)
+                           creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
         out = r.stdout.strip()
         if out.startswith("ERROR:"):
             return False, out[6:]
@@ -213,25 +227,85 @@ def run_ps_file(path: str, args: list[str] = None, timeout: int = 45) -> tuple[b
             pass
 
 
-def run_invoke_command(dc: str, username: str, timeout: int = 60) -> tuple[bool, str]:
-    """Run PS_QUERY_ON_DC on a remote DC via Invoke-Command (WinRM)."""
-    # Write the inner script to a temp file
-    inner_path = write_temp_ps(PS_QUERY_ON_DC)
-
-    # Wrapper that calls Invoke-Command with the script file contents as a scriptblock
-    wrapper = f"""
-$inner = Get-Content -Path '{inner_path}' -Raw
-$sb    = [scriptblock]::Create($inner)
-try {{
-    $result = Invoke-Command -ComputerName '{dc}' -ScriptBlock $sb -ArgumentList '{username}' -ErrorAction Stop
-    $result
-}} catch {{
+# Calls Invoke-Command with the inner script file's contents as a scriptblock.
+# The DC, username and window arrive as parameters, never pasted into the script
+# text, so a name like o'brien can't break out of a quoted string.
+PS_INVOKE = """
+param([string]$InnerPath, [string]$DC, [string]$Username, [int]$Hours)
+$sb = [scriptblock]::Create((Get-Content -Path $InnerPath -Raw))
+try {
+    Invoke-Command -ComputerName $DC -ScriptBlock $sb -ArgumentList $Username, $Hours -ErrorAction Stop
+} catch {
     Write-Output "ERROR:$($_.Exception.Message)"
     exit 1
-}}
+}
 """
-    wrapper_path = write_temp_ps(wrapper)
-    ok, out = run_ps_file(wrapper_path, timeout=timeout)
+
+# Characters AD doesn't allow in a sAMAccountName
+_SAM_INVALID = set('"/\\[]:;|=,+*?<>')
+_HOST_RE     = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+
+
+def validate_username(name: str) -> str:
+    """Return an error message for an invalid sAMAccountName, or '' if it's fine."""
+    if not name:
+        return "Enter a username"
+    if len(name) > 104 or name.endswith(".") or any(c in _SAM_INVALID or ord(c) < 32 for c in name):
+        return "Enter the sAMAccountName only (no DOMAIN\\ prefix, and none of \" / \\ [ ] : ; | = , + * ? < >)"
+    return ""
+
+
+def validate_dc(dc: str) -> str:
+    """Return an error message for an invalid DC host name, or '' if it's fine (or empty)."""
+    if dc and not _HOST_RE.match(dc):
+        return f"'{dc}' isn't a valid host name"
+    return ""
+
+
+def parse_hours(text: str) -> int | None:
+    """Lookback hours from the UI field: a whole number from 1 to 720, else None."""
+    try:
+        h = int(text.strip())
+    except ValueError:
+        return None
+    return h if 1 <= h <= 720 else None
+
+
+def parse_events(out: str, dc: str) -> list[dict]:
+    """Parse one DC's JSON output (an object or a list) and tag each event with the DC."""
+    raw = out.strip()
+    if not raw or raw == "[]":
+        return []
+    if raw.startswith("{"):
+        raw = f"[{raw}]"
+    parsed = json.loads(raw)
+    evts = parsed if isinstance(parsed, list) else [parsed]
+    for e in evts:
+        e["DC"] = dc
+    return evts
+
+
+def merge_events(results: dict[str, list[dict]]) -> list[dict]:
+    """Merge per-DC events, drop ones reported by more than one DC, newest first."""
+    seen, merged = set(), []
+    for dc, evts in results.items():
+        for ev in evts:
+            key = (ev.get("Time"), ev.get("EventId"), ev.get("Computer"), ev.get("IP"))
+            if key not in seen:
+                seen.add(key)
+                merged.append(ev)
+    merged.sort(key=lambda e: e.get("Time", ""), reverse=True)
+    return merged
+
+
+def run_invoke_command(dc: str, username: str, hours: int = DEFAULT_LOOKBACK_HOURS,
+                       timeout: int = 120) -> tuple[bool, str]:
+    """Run PS_QUERY_ON_DC on a remote DC via Invoke-Command (WinRM)."""
+    inner_path   = write_temp_ps(PS_QUERY_ON_DC)
+    wrapper_path = write_temp_ps(PS_INVOKE)
+    ok, out = run_ps_file(wrapper_path, ["-InnerPath", inner_path, "-DC", dc,
+                                         "-Username", username, "-Hours", str(hours)],
+                          timeout=timeout)
     try:
         os.unlink(inner_path)
     except Exception:
@@ -246,8 +320,8 @@ class BadPwdApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Bad Password Lookup  v3")
-        self.geometry("920x640")
-        self.minsize(780, 500)
+        self.geometry("1040x640")
+        self.minsize(900, 500)
         self.configure(bg=BG)
         self.resizable(True, True)
 
@@ -330,10 +404,15 @@ class BadPwdApp(tk.Tk):
         ttk.Label(sr, text="DC override:", style="Muted.TLabel").grid(row=0, column=2, padx=(0, 8))
         self._ent_dc = ttk.Entry(sr, width=24, font=MONO)
         self._ent_dc.grid(row=0, column=3, ipady=5, padx=(0, 16))
+        ttk.Label(sr, text="Lookback (h):", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 8))
+        self._ent_hours = ttk.Entry(sr, width=5, font=MONO)
+        self._ent_hours.insert(0, str(DEFAULT_LOOKBACK_HOURS))
+        self._ent_hours.grid(row=0, column=5, ipady=5, padx=(0, 16))
+        self._ent_hours.bind("<Return>", lambda _: self._go())
         self._btn = ttk.Button(sr, text="Lookup", style="Go.TButton", command=self._go)
-        self._btn.grid(row=0, column=4, padx=(0, 8))
+        self._btn.grid(row=0, column=6, padx=(0, 8))
         ttk.Button(sr, text="Clear", style="Sub.TButton",
-                   command=self._clear).grid(row=0, column=5)
+                   command=self._clear).grid(row=0, column=7)
 
         # DC pills
         self._dc_frame = ttk.Frame(self, padding=(18, 0, 18, 8))
@@ -491,6 +570,13 @@ class BadPwdApp(tk.Tk):
         if not user:
             return
         override = self._ent_dc.get().strip()
+        hours = parse_hours(self._ent_hours.get())
+        err = validate_username(user) or validate_dc(override)
+        if not err and hours is None:
+            err = "Lookback must be a whole number of hours from 1 to 720"
+        if err:
+            self._status(err)
+            return
         dcs = [override] if override else self._all_dcs
         if override and override not in self._all_dcs:
             self._all_dcs = [override] + self._all_dcs
@@ -503,10 +589,10 @@ class BadPwdApp(tk.Tk):
         self._btn.config(state="disabled")
         self._clear(silent=True)
         self._prog.start(12)
-        self._status(f"Querying {len(dcs)} DC(s) for '{user}' via WinRM…")
-        threading.Thread(target=self._worker, args=(user, dcs), daemon=True).start()
+        self._status(f"Querying {len(dcs)} DC(s) for '{user}' over the last {hours}h via WinRM…")
+        threading.Thread(target=self._worker, args=(user, dcs, hours), daemon=True).start()
 
-    def _worker(self, user, dcs):
+    def _worker(self, user, dcs, hours):
         primary = self._pdc.get() or dcs[0]
 
         # AD user attributes
@@ -519,20 +605,13 @@ class BadPwdApp(tk.Tk):
         lock    = threading.Lock()
 
         def query(dc):
-            ok, out = run_invoke_command(dc, user, timeout=60)
+            ok, out = run_invoke_command(dc, user, hours)
             evts, err = [], ""
             if not ok:
                 err = out
-            elif out.strip() and out.strip() != "[]":
+            else:
                 try:
-                    raw = out.strip()
-                    if raw.startswith("{"):
-                        raw = f"[{raw}]"
-                    parsed = json.loads(raw)
-                    evts = parsed if isinstance(parsed, list) else [parsed]
-                    # tag each event with which DC reported it
-                    for e in evts:
-                        e["DC"] = dc
+                    evts = parse_events(out, dc)
                 except Exception as ex:
                     err = f"Parse error: {ex}"
             with lock:
@@ -542,17 +621,13 @@ class BadPwdApp(tk.Tk):
 
         threads = [threading.Thread(target=query, args=(dc,), daemon=True) for dc in dcs]
         for t in threads: t.start()
-        for t in threads: t.join(timeout=65)
+        for t in threads: t.join(timeout=125)
 
-        # merge & deduplicate
-        seen, merged = set(), []
-        for dc, evts in results.items():
-            for ev in evts:
-                key = (ev.get("Time"), ev.get("EventId"), ev.get("Computer"), ev.get("IP"))
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(ev)
-        merged.sort(key=lambda e: e.get("Time", ""), reverse=True)
+        with lock:
+            for dc in dcs:
+                if dc not in results:
+                    errors[dc] = "No answer within 125s"
+            merged = merge_events(results)
 
         self.after(0, lambda: self._done(ok_u, out_u, merged, errors, user))
 
