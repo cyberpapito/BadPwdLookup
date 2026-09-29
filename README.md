@@ -83,6 +83,17 @@ pyinstaller --onefile --noconsole --name BadPwdLookup badpwd_lookup.py
 
 Output will be in `dist/BadPwdLookup.exe`.
 
+### Releases
+
+GitHub Actions (`.github/workflows/build.yml`) runs the tests on Windows and Linux and builds the `.exe` on Windows for every push and pull request; the build is downloadable from the run's **Artifacts**. To publish a release, push a version tag:
+
+```bash
+git tag v3.1.0
+git push origin v3.1.0
+```
+
+That publishes `BadPwdLookup.exe` (and its SHA-256) as a **pre-release**. After trying it against real DCs, edit the release on GitHub and tick **Set as the latest release**.
+
 ---
 
 ## Tests
